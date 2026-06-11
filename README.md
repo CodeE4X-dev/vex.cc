@@ -1,215 +1,258 @@
-# TODO — Round 2 (Claimer / giver / server / stock audit)
+# TODO — Ronde 2 (audit Claimer / giver / server / stock)
 
-Investigated against `files/Claimer.lua`, `files/giver.lua`, `server.js`, `files/Stock*.lua`.
-Two reported bugs are root-caused below (they are the SAME underlying bug). Plus 100+ fix/improve/add/remove/test items.
+Diinvestigasi terhadap `files/Claimer.lua`, `files/giver.lua`, `server.js`, `files/Stock*.lua`.
+Dua bug yang dilaporkan sudah di-root-cause di bawah (akarnya SAMA). Plus 100+ item fix/improve/add/remove/test.
 
-Approve point-by-point (e.g. "C-1, C-2, B-3..B-9 ok") and I implement (no code comments).
-
----
-
-## ROOT-CAUSE OF THE TWO REPORTED BUGS
-
-### Bug A — embed shows "client-release: trade never started within 120s" on a trade that SUCCEEDED
-- Success path with victim still present (`Claimer.lua:1583-1602`) sets `startTime = 0` + `lastSuccessAt = os.time()` but keeps `hitId` and **does not reset `claimedAt`**.
-- The watchdog at `Claimer.lua:443` fires when `claimedAt > 0 and startTime == 0` — it does **not** exclude `lastSuccessAt > 0`. So a deferred-success looks identical to never-started, and once `os.time() - claimedAt > 120` it calls `releaseStuckClaim("trade never started")` → posts `failed`.
-
-### Bug B — "🔄 Claimer X left server; listener stays armed for rejoin" when claimer didn't really leave
-- Chain reaction from Bug A: after the false `failed`, claimer abandons + ServerHops, so giver's raw `Players.PlayerRemoving` (`giver.lua:1157`) logs "left". The claimer left only because Bug A killed a good trade.
+Approve per-poin (mis. "C-1, C-2, CL-3..CL-9 ok") lalu aku implement (TANPA comment di code).
 
 ---
 
-## CRITICAL FIXES (do first)
+## ATURAN WAJIB (berlaku untuk semua implementasi)
 
-- **C-1** `Claimer.lua:443` — add `and (currentTradeData.lastSuccessAt or 0) == 0` to the never-started guard so a deferred-success is never treated as never-started. (Primary fix for Bug A.)
-- **C-2** `Claimer.lua:1583` deferred-success path — also reset `currentTradeData.claimedAt = 0` (or refresh it to `os.time()`) so the 120s window can't fire against an already-successful chain.
-- **C-3** `Claimer.lua:402 releaseStuckClaim` — early-return if `(currentTradeData.lastSuccessAt or 0) > 0`; never post `failed` after any success. Log + finalise as success instead.
-- **C-4** `releaseStuckClaim` — before posting `failed`, re-read hit status from server (`GET /api/hits/queue` or a `GET /api/hits/:id`) and skip if already `success`. Prevents racing a server-side success.
-- **C-5** Watchdog loop (`Claimer.lua:418`) — when `lastSuccessAt > 0`, switch from "never started" logic to "deferred chain" logic (wait for victim leave / followup window), never to `releaseStuckClaim`.
-- **C-6** `giver.lua:1157` — split the log: if the claimer left AFTER a confirmed trade with us, log "✅ Claimer X done & left" (success), not "left; armed for rejoin". Track a per-claimer `tradedOnce` flag.
-- **C-7** `giver.lua` PlayerRemoving — debounce: wait 2–3s and re-check `Players:FindFirstChild(name)` before declaring "left" (covers same-frame respawn/relog flaps).
-- **C-8** Add a server endpoint `GET /api/hits/:id` returning a single hit (used by C-4); currently only `/api/hits/queue` exists.
-- **C-9** `Claimer.lua` — when posting any final status, include the locally-known `itemsTransferred`/`rapTransferred` so a late success isn't recorded as 0/0.
-- **C-10** `server.js:5015 /status` — when a `failed` arrives but the hit already has `itemsTransferred > 0` recorded this session, log a warning and prefer the richer record (defensive against Bug A residue).
+- **A-1** JANGAN PERNAH pakai `PlayerRemoving` listener untuk mendeteksi apakah **DIRI SENDIRI** (LocalPlayer) sudah leave/keluar server. Untuk tahu status diri sendiri, pakai **server heartbeat** / **bridge** / state internal — bukan listener leave atas diri sendiri.
+- **A-2** `PlayerRemoving` untuk mendeteksi **player LAIN** (victim, claimer, target) leave → BOLEH. Semua pemakaian sekarang (`giver.lua:1051`, `giver.lua:1154`, `Claimer.lua:1640`) memang mendeteksi player lain → tetap dipertahankan, hanya diperhalus (lihat C-6/C-7).
+- **A-3** TANPA comment di semua code yang aku tulis/ubah.
+- **A-4** Untuk verifikasi data exact saat testing, pakai **Bridge** (lihat section BRIDGE di bawah) — jangan menebak; jalankan Lua live & baca arg/response asli.
+- **A-5** Tema GUI: **dark black-grey** (lihat section GUI).
 
 ---
 
-## CLAIMER.LUA — TRADE STATE MACHINE
+## ROOT-CAUSE DUA BUG YANG DILAPORKAN
 
-- **CL-1** Reset `claimedAt = 0` in every terminal path (`finishHit`, `abandonClaimLocal`, `releaseStuckClaim` already do; audit deferred + followup paths).
-- **CL-2** Replace the 3 near-duplicate `currentTradeData = { ... }` re-inits (`~518`, `~564`) with a single `resetTradeData(keepSuccess)` helper to stop drift between them.
-- **CL-3** Single source of truth for "trade active": one `isTradeActive()` instead of mixing `targetPlayer ~= ""`, `hitId ~= nil`, `startTime ~= 0`, `confirmed`.
-- **CL-4** Cancel the `FOLLOWUP_WINDOW_SEC + 30` `task.delay` (`1596`) when the hit finalises early, else it fires stale against a recycled `hitId`.
-- **CL-5** Guard the delayed-followup closure with the captured `savedHit` AND `lastSuccessAt` snapshot to avoid acting on a new claim that reused state.
-- **CL-6** Confirm watchdog (`1626`) can fire `recordTradeResult("success")` even if no items moved — require `itemsTransferred > 0` OR `confirmed` before claiming success, else mark `failed`/`unknown`.
-- **CL-7** `tradeItemsCount`/`tradeRAPValue` are module-level and reused across rounds; snapshot them per-confirm to avoid double counting / stale RAP.
-- **CL-8** RAP accumulation (`1702-1703`) assumes every `Confirmed` is a new batch — dedupe by trade-session id so a re-fired `Confirmed` doesn't double the totals.
-- **CL-9** `recordTradeResult` "should record" heuristic (`496-511`) can mark a real success as not-recorded ("random-or-cancelled") if `expectedTarget` was cleared early — record items/RAP regardless of the success-rate decision.
-- **CL-10** `postHitStatus` has no retry; wrap in 2–3 attempts w/ backoff so a dropped final status isn't lost (causes server-side stale→timeout later).
-- **CL-11** `postHitStatus` should treat HTTP 409 `already-finalised`/`cannot-downgrade-success` as terminal-OK (stop retrying), not as failure.
-- **CL-12** Add idempotency: include a `clientFinalId` (hitId + result) so duplicate final posts are no-ops server-side.
-- **CL-13** `TeleportInitFailed` handler (`460`) calls `releaseStuckClaim` unconditionally — guard with `lastSuccessAt == 0` too (don't fail a finished chain on a late teleport error).
-- **CL-14** Wrong-server release (`447`, `TELEPORT_CONFIRM_WINDOW = 8s`) is aggressive; raise to ~15s or verify teleport actually queued before releasing.
-- **CL-15** Persisted `loadHitState()` is read twice per tick (`441-442`); read once and cache.
-- **CL-16** Watchdog `task.wait(10)` means up to 10s late detection of teleport failure — split into a fast (2s) teleport-confirm check and slow (10s) heartbeat.
-- **CL-17** On `claimerHandleCmd` transfer-items, 90 items × `PER_ADD_DELAY` can block ~45s+30s; run as `task.spawn` so the heartbeat coroutine isn't starved (prevents claimer being marked stale).
-- **CL-18** Same for transfer-tokens 30s confirm loop — ensure heartbeat keeps firing during it.
-- **CL-19** `ReceivedTradeRequest` auto-accept should re-validate giver against the active hit's expected victim, not accept any giver while a hit is held.
-- **CL-20** Add a hard ceiling on a single hit's lifetime (e.g. 8 min) → finalise as `timeout` locally and free the claimer rather than relying only on server stale recovery.
-- **CL-21** Log the actual `postHitStatus` HTTP code + body to GUI/console for every final post (testing visibility).
-- **CL-22** When `recordTradeResult` decides `failed`, include the last server heartbeat code + age so the embed message is diagnostic, not just "trade never started".
-- **CL-23** Track `confirmedTriggered`/`confirmed` reset on new claim to avoid a stale `confirmed=true` short-circuiting the next victim's auto-ready.
-- **CL-24** `isTradeUiActive()` is polled in 3 loops; consolidate to one signal-driven state.
+### Bug A — embed "client-release: trade never started within 120s" padahal trade SUKSES
+- Path sukses saat victim masih di server (`Claimer.lua:1583-1602`) set `startTime = 0` + `lastSuccessAt = os.time()` tapi `hitId` tetap dipegang dan **`claimedAt` tidak di-reset**.
+- Watchdog `Claimer.lua:443` nyala kalau `claimedAt > 0 and startTime == 0` — TIDAK mengecualikan `lastSuccessAt > 0`. Jadi deferred-success kelihatan identik dengan never-started, dan begitu `os.time() - claimedAt > 120` → `releaseStuckClaim("trade never started")` → kirim `failed`.
+
+### Bug B — "🔄 Claimer X left server; listener stays armed for rejoin" padahal claimer nggak beneran leave
+- Efek domino dari Bug A: setelah `failed` palsu, claimer abandon + ServerHop keluar, jadi `Players.PlayerRemoving` giver (`giver.lua:1157`) nge-log "left". Claimer keluar HANYA karena Bug A membunuh trade yang bagus. (Catatan: ini deteksi player LAIN → sesuai A-2, listener-nya tetap, cuma log-nya yang diperbaiki.)
+
+---
+
+## FIX KRITIS (kerjakan duluan)
+
+- **C-1** `Claimer.lua:443` — tambah `and (currentTradeData.lastSuccessAt or 0) == 0` ke guard never-started biar deferred-success nggak pernah dianggap never-started. (Fix utama Bug A.)
+- **C-2** `Claimer.lua:1583` path deferred-success — reset juga `currentTradeData.claimedAt = 0` (atau refresh ke `os.time()`) supaya window 120s nggak bisa nyala ke chain yang sudah sukses.
+- **C-3** `Claimer.lua:402 releaseStuckClaim` — early-return kalau `(currentTradeData.lastSuccessAt or 0) > 0`; jangan pernah kirim `failed` setelah ada sukses. Log + finalise jadi success.
+- **C-4** `releaseStuckClaim` — sebelum kirim `failed`, baca status hit dari server (`GET /api/hits/:id`, lihat C-8) dan skip kalau sudah `success`. Cegah racing dengan success sisi server.
+- **C-5** Watchdog loop (`Claimer.lua:418`) — kalau `lastSuccessAt > 0`, pindah dari logika "never started" ke logika "deferred chain" (tunggu victim leave / followup window), jangan ke `releaseStuckClaim`.
+- **C-6** `giver.lua:1157` — pisahkan log: kalau claimer leave SETELAH ada trade confirmed sama kita, log "✅ Claimer X selesai & keluar" (success), bukan "left; armed for rejoin". Pakai flag per-claimer `tradedOnce`. (PlayerRemoving tetap — ini player lain, A-2.)
+- **C-7** `giver.lua` PlayerRemoving claimer — debounce: tunggu 2–3s lalu re-cek `Players:FindFirstChild(name)` sebelum nyatain "left" (nutup flap respawn/relog). (Tetap deteksi player lain, A-2.)
+- **C-8** Tambah endpoint server `GET /api/hits/:id` (single hit) buat C-4; sekarang cuma ada `/api/hits/queue`.
+- **C-9** `Claimer.lua` — saat kirim status final apapun, sertakan `itemsTransferred`/`rapTransferred` yang diketahui lokal biar success telat nggak kecatat 0/0.
+- **C-10** `server.js:5015 /status` — kalau `failed` masuk tapi hit sudah punya `itemsTransferred > 0`, log warning & pilih record yang lebih kaya (defensif terhadap sisa Bug A).
+- **C-11** (A-1) Audit: pastikan TIDAK ADA deteksi "diri sendiri leave" lewat PlayerRemoving di manapun. Status diri sendiri murni dari heartbeat/server. (Sekarang sudah clean — jadikan aturan permanen + komentar di TODO, bukan di code.)
+
+---
+
+## CLAIMER.LUA — STATE MACHINE TRADE
+
+- **CL-1** Reset `claimedAt = 0` di semua jalur terminal (audit path deferred + followup).
+- **CL-2** Ganti 3 blok `currentTradeData = { ... }` yang hampir sama (`~518`, `~564`) dengan satu helper `resetTradeData(keepSuccess)` biar nggak drift.
+- **CL-3** Satu sumber kebenaran "trade aktif": satu `isTradeActive()` daripada campur `targetPlayer ~= ""`, `hitId ~= nil`, `startTime ~= 0`, `confirmed`.
+- **CL-4** Cancel `task.delay(FOLLOWUP_WINDOW_SEC + 30)` (`1596`) saat hit finalise lebih awal, biar nggak nyala basi ke `hitId` yang sudah didaur ulang.
+- **CL-5** Guard closure followup-delay dengan snapshot `savedHit` DAN `lastSuccessAt` biar nggak nge-act ke claim baru yang reuse state.
+- **CL-6** Confirm watchdog (`1626`) bisa nge-fire `recordTradeResult("success")` walau nggak ada item pindah — wajib `itemsTransferred > 0` ATAU `confirmed` sebelum klaim success, kalau nggak tandai `failed`/`unknown`.
+- **CL-7** `tradeItemsCount`/`tradeRAPValue` module-level dipakai ulang antar-ronde; snapshot per-confirm biar nggak dobel/stale.
+- **CL-8** Akumulasi RAP (`1702-1703`) nganggap tiap `Confirmed` batch baru — dedupe pakai trade-session id biar `Confirmed` yang ke-fire ulang nggak dobel total.
+- **CL-9** Heuristik "should record" (`496-511`) bisa nandai success asli jadi nggak kecatat ("random-or-cancelled") kalau `expectedTarget` keburu di-clear — catat items/RAP terlepas dari keputusan success-rate.
+- **CL-10** `postHitStatus` nggak ada retry; bungkus 2–3 attempt + backoff biar status final yang drop nggak hilang (yang bikin server stale→timeout).
+- **CL-11** `postHitStatus` harus anggap HTTP 409 `already-finalised`/`cannot-downgrade-success` sebagai terminal-OK (berhenti retry), bukan failure.
+- **CL-12** Idempotency: sertakan `clientFinalId` (hitId + result) biar post final dobel jadi no-op di server.
+- **CL-13** Handler `TeleportInitFailed` (`460`) manggil `releaseStuckClaim` tanpa syarat — guard dengan `lastSuccessAt == 0` juga.
+- **CL-14** Wrong-server release (`447`, `TELEPORT_CONFIRM_WINDOW = 8s`) terlalu agresif; naikkan ~15s atau verifikasi teleport benar-benar antri sebelum release.
+- **CL-15** `loadHitState()` dibaca 2x per tick (`441-442`); baca sekali, cache.
+- **CL-16** Watchdog `task.wait(10)` → deteksi teleport-fail telat 10s; pecah jadi cek cepat (2s) untuk teleport-confirm dan lambat (10s) untuk heartbeat.
+- **CL-17** `transfer-items` 90 item × `PER_ADD_DELAY` blocking ~45s+30s; jalankan via `task.spawn` biar coroutine heartbeat nggak kelaparan (cegah claimer ditandai stale).
+- **CL-18** Sama untuk `transfer-tokens` confirm-loop 30s — pastikan heartbeat tetap jalan.
+- **CL-19** Auto-accept `ReceivedTradeRequest` harus re-validasi giver terhadap expected victim hit yang aktif, bukan terima giver siapapun saat hit dipegang.
+- **CL-20** Plafon keras umur 1 hit (mis. 8 menit) → finalise `timeout` lokal & bebaskan claimer, jangan cuma andalkan stale recovery server.
+- **CL-21** Log HTTP code + body `postHitStatus` ke GUI/console untuk tiap post final (visibilitas testing).
+- **CL-22** Saat `recordTradeResult` mutusin `failed`, sertakan heartbeat code + age terakhir biar message embed diagnostik, bukan cuma "trade never started".
+- **CL-23** Reset `confirmedTriggered`/`confirmed` saat claim baru biar `confirmed=true` basi nggak nge-short-circuit auto-ready victim berikutnya.
+- **CL-24** `isTradeUiActive()` dipoll di 3 loop; konsolidasi jadi satu state berbasis signal.
 
 ## CLAIMER.LUA — CLAIM / IDLE PICKUP
 
-- **CL-25** Deferred-success holds `hitId` up to `FOLLOWUP_WINDOW_SEC+30` (=330s) → claimer reports `busy` and won't grab new hits. Shorten followup to ~60–90s, OR allow claiming a new hit while a followup is pending (decouple "busy" from "followup").
-- **CL-26** Heartbeat status (`Claimer.lua:~1762`) reports `busy` whenever `hitId` set — report `followup` separately so dashboard shows the claimer is actually free-ish.
-- **CL-27** `fireClaim` thundering herd: every long-poll waiter wakes and all POST `/api/hits/claim` at once; only one wins (15s claim lock), rest waste a request. Add small jitter or server-side per-claimer assignment.
-- **CL-28** Long-poll loop `task.wait(0.2)` after each response is fine, but on error path it does `task.wait(2)` then `task.wait(0.2)` — collapse to a single backoff.
-- **CL-29** `requestHitClaim` has no preferredVictim use; could pass last-known victim to bias toward retrades.
-- **CL-30** Add exponential backoff + cap on `connectWebSocket` reconnect (`1241`) — currently `task.wait(1)` tight recursive loop can spin if gateway rejects.
-- **CL-31** `connectWebSocket` recursion grows the call stack on every reconnect — convert to a `while true` loop.
-- **CL-32** Discord heartbeat loop inside `OnMessage` (`1223`) never exits on close — leaks a coroutine per reconnect. Tie it to a token/generation that the OnClose invalidates.
-- **CL-33** `is_channel_supported` + `Action(message.content)` path: validate/whitelist commands; a malformed Discord message shouldn't crash the handler (wrap in pcall).
-- **CL-34** Fallback claim timer (20s) + long-poll both call `fireClaim`; ensure `claimWakeup` can't double-process within the same tick.
+- **CL-25** Deferred-success pegang `hitId` sampai `FOLLOWUP_WINDOW_SEC+30` (=330s) → claimer report `busy` & nggak ambil hit baru. Pendekkan followup ~60–90s, ATAU izinkan claim hit baru saat followup pending (decouple "busy" dari "followup"). **Ini win utama "proses instan saat idle".**
+- **CL-26** Status heartbeat (`~1762`) report `busy` tiap `hitId` keisi — report `followup` terpisah biar dashboard tahu claimer sebenarnya agak bebas.
+- **CL-27** Thundering herd `fireClaim`: tiap waiter long-poll kebangun & semua POST `/api/hits/claim` barengan; cuma satu menang (lock 15s), sisanya buang request. Tambah jitter atau assignment per-claimer sisi server (SV-9).
+- **CL-28** Error path long-poll `task.wait(2)` lalu `task.wait(0.2)` — gabung jadi satu backoff.
+- **CL-29** `requestHitClaim` nggak pakai preferredVictim; bisa kirim victim terakhir buat bias ke retrade.
+- **CL-30** Backoff eksponensial + cap di reconnect `connectWebSocket` (`1241`) — sekarang `task.wait(1)` rekursif ketat bisa spin kalau gateway nolak.
+- **CL-31** Rekursi `connectWebSocket` numpuk call stack tiap reconnect — ubah jadi loop `while true`.
+- **CL-32** Heartbeat loop Discord di dalam `OnMessage` (`1223`) nggak pernah exit saat close — bocor 1 coroutine per reconnect. Ikat ke token/generasi yang di-invalidasi `OnClose`.
+- **CL-33** Path `is_channel_supported` + `Action(message.content)`: validasi/whitelist command; message Discord rusak jangan bikin handler crash (bungkus pcall).
+- **CL-34** Timer fallback (20s) + long-poll dua-duanya manggil `fireClaim`; pastikan `claimWakeup` nggak dobel-proses dalam tick yang sama.
 
 ## CLAIMER.LUA — CLEANUP / REMOVE
 
-- **CL-35** Strip all code comments in `Claimer.lua` (user rule: no comments).
-- **CL-36** Remove the dead `TradeInProgress` references mentioned in the comment at `1672` (confirm none remain).
-- **CL-37** Remove `print("[SuccessRate] ...")` debug prints or route them through `notifyGUI`/logger consistently.
-- **CL-38** De-duplicate the two identical `currentTradeData = {...}` blocks (see CL-2).
-- **CL-39** Consolidate repeated `http_request or (syn and syn.request) or request` into the existing `getRequestFunc()` everywhere.
-
-## CLAIMER.LUA — GUI
-
-- **CL-40** Show current hit state (IDLE / CLAIMED / TRADING / CONFIRMING / FOLLOWUP / FINALISING) as an explicit status line.
-- **CL-41** Show last final result + reason + items/RAP transferred.
-- **CL-42** Show last `postHitStatus` HTTP code (green/red dot) for at-a-glance health.
-- **CL-43** Show queue pending/processing counts (already polled at `869`) in the panel.
-- **CL-44** Show websocket/long-poll connection health + last wake time.
-- **CL-45** Expandable log panel (matching Stock GUI style) with severity colors.
-- **CL-46** Button: "Force release current hit" for manual recovery.
-- **CL-47** Button: "Re-fire claim now" (manual `fireClaim`).
-- **CL-48** Countdown to next fallback claim + followup-window remaining.
+- **CL-35** Strip semua comment di `Claimer.lua` (A-3).
+- **CL-36** Hapus referensi mati `TradeInProgress` yang disebut di comment `1672` (konfirmasi nggak ada sisa).
+- **CL-37** Hapus `print("[SuccessRate] ...")` atau rutekan lewat `notifyGUI`/logger konsisten.
+- **CL-38** De-dupe dua blok `currentTradeData = {...}` (lihat CL-2).
+- **CL-39** Satukan `http_request or (syn and syn.request) or request` ke `getRequestFunc()` di semua tempat.
 
 ---
 
 ## GIVER.LUA
 
-- **GV-1** (C-6/C-7) Distinguish "claimer done+left" vs "claimer left mid-trade" in the PlayerRemoving log.
-- **GV-2** Track per-claimer `tradedItemsCount` so the log can say how much was taken before they left.
-- **GV-3** `startedClaimers[name] = nil` on leave wipes progress; persist a "completed with X" record so a rejoin doesn't restart a finished claimer.
-- **GV-4** Victim heartbeat loop (`925-944`) only breaks on 409/404 — also break/stop when the giver's own trade is fully done to free the loop.
-- **GV-5** Heartbeat `task.wait(10)` vs server 40s leave-timeout gives only ~3 missed beats of slack; lower to 7–8s for safety margin during lag.
-- **GV-6** Heartbeat coroutine can be starved by the giver's long trade loops — verify it runs in its own `task.spawn` unaffected by trade waits.
-- **GV-7** `startTradeOnce(p, 99)` initial delay 10s (`PlayerAdded`) can exceed claimer's teleport-confirm assumptions; align timings with Claimer's `TELEPORT_CONFIRM_WINDOW`.
-- **GV-8** Re-arm-on-rejoin can loop forever if a claimer crashes repeatedly; cap re-arm attempts per claimer.
-- **GV-9** Validate the claimer name against the active hit's claimer (`/api/hits/queue`) so a random whitelisted name leaving doesn't emit a misleading "left" log.
-- **GV-10** Add a webhook log when the victim heartbeat first returns 409 (server already finalised) so giver+claimer timelines line up in testing.
-- **GV-11** Log the hit `id` in every giver log line so a hit can be traced across giver↔claimer↔server.
-- **GV-12** Strip all comments in `giver.lua`.
-- **GV-13** Send giver-side `itemsRemaining` count with heartbeat so server/claimer can decide retrade vs finalise smartly (instead of fixed followup window).
-- **GV-14** On final success, proactively POST a "victim-finished" to the server so claimer's deferred path resolves immediately (kills the 330s wait — ties to CL-25).
-- **GV-15** Guard `isInventoryStillGood` re-trade loop against trading the same locked items repeatedly (skip TradeLock/Listing items).
+- **GV-1** (C-6/C-7) Bedakan "claimer selesai+keluar" vs "claimer keluar mid-trade" di log PlayerRemoving.
+- **GV-2** Track `tradedItemsCount` per-claimer biar log bisa sebut berapa yang diambil sebelum keluar.
+- **GV-3** `startedClaimers[name] = nil` saat leave menghapus progress; persist record "selesai dengan X" biar rejoin nggak restart claimer yang sudah kelar.
+- **GV-4** Loop victim heartbeat (`925-944`) cuma break di 409/404 — break juga saat trade giver benar-benar kelar biar loop bebas.
+- **GV-5** Heartbeat `task.wait(10)` vs timeout leave server 40s cuma ~3 beat slack; turunkan ke 7–8s buat margin saat lag.
+- **GV-6** Coroutine heartbeat bisa kelaparan oleh loop trade panjang giver — pastikan jalan di `task.spawn` sendiri, lepas dari wait trade.
+- **GV-7** `startTradeOnce(p, 99)` delay awal 10s (`PlayerAdded`) bisa lewat asumsi teleport-confirm claimer; selaraskan dengan `TELEPORT_CONFIRM_WINDOW` Claimer.
+- **GV-8** Re-arm-on-rejoin bisa loop selamanya kalau claimer crash berulang; cap percobaan re-arm per claimer.
+- **GV-9** Validasi nama claimer terhadap claimer hit aktif (`/api/hits/:id`) biar nama whitelist random yang leave nggak nge-emit log "left" menyesatkan.
+- **GV-10** Log webhook saat victim heartbeat pertama balik 409 (server sudah finalise) biar timeline giver+claimer sinkron saat testing.
+- **GV-11** Log hit `id` di tiap baris log giver biar 1 hit bisa ditrace lintas giver↔claimer↔server.
+- **GV-12** Strip semua comment di `giver.lua` (A-3).
+- **GV-13** Kirim `itemsRemaining` sisi giver bareng heartbeat biar server/claimer bisa mutusin retrade vs finalise pintar (ganti window tetap).
+- **GV-14** Saat success final, proaktif POST "victim-finished" ke server biar path deferred claimer langsung kelar (matiin tunggu 330s — terkait CL-25/SV-2). **Win idle.**
+- **GV-15** Guard loop re-trade `isInventoryStillGood` biar nggak trade item locked yang sama berulang (skip TradeLock/Listing).
 
 ---
 
 ## SERVER.JS — HIT QUEUE
 
-- **SV-1** Add `GET /api/hits/:id` (single hit) — needed by Claimer C-4 to verify status before posting failed.
-- **SV-2** Add `POST /api/hits/:id/victim-finished` (or reuse status `leave`/flag) so giver can signal "inventory empty / done" → server finalises + wakes claimer instantly (ties GV-14 / CL-25).
-- **SV-3** `/status` (`5015`) — when downgrading is rejected (409), return the existing record so the client can self-heal (already returns reason; include `itemsTransferred`).
-- **SV-4** Record a structured event log per status transition (id, from, to, claimer, ts, message) to a ring buffer + `GET /api/hits/events` for testing/timeline.
-- **SV-5** Stale-recovery (`4296`, 5min) and victim-leave (40s) thresholds should be per-hit overridable via env already — surface them in `/api/hits/stats` for visibility.
-- **SV-6** When a hit is recovered from stale (`4303`), increment a metric + log which claimer dropped it (helps spot Bug A pattern: success-then-stale).
-- **SV-7** `notifyHitsWaiters` clears ALL waiters on any version bump — fine, but add the changed hit id(s) in the wait response so claimers can skip irrelevant wakes.
-- **SV-8** Optional true WebSocket (`ws` pkg) endpoint `/ws/hits` pushing `{type:'hit', id}` to idle claimers; keep long-poll as fallback. (User asked — but note long-poll already ~0.2s; WS mainly cuts request overhead + enables targeted assignment.)
-- **SV-9** Server-side assignment: instead of N claimers racing `/claim`, let server pick an idle claimer (by heartbeat) and push the hit to it → eliminates thundering herd (CL-27).
-- **SV-10** Track claimer presence from `/api/claimers/heartbeat` and expose `idle` list so SV-9 can target.
-- **SV-11** Guard `/claim` against handing the same victim to two claimers in different servers (dedupe by victim+jobId).
-- **SV-12** `HITS_CLAIM_LOCK_MS = 15s` global lock serialises ALL claims across all victims — make it per-nothing/optimistic (compare-and-set on the candidate) so unrelated claims don't block each other.
-- **SV-13** Add `claimedByJobId` so a heartbeat/status from the wrong server instance is rejected (prevents cross-server status clobber).
-- **SV-14** Validate `itemsTransferred`/`rapTransferred` are non-negative numbers; clamp.
-- **SV-15** `recordHitToStats` failure is only `console.error` — add a retry/queue so stats aren't silently lost.
-- **SV-16** Embed builder: include hit `id` (short) and claimer in the title/footer for traceability.
-- **SV-17** Persist `hitsVersion` so a server restart doesn't reset long-poll versions to 0 and falsely signal "change" to every claimer.
-- **SV-18** `/api/hits/wait` max 30s; align with claimer's 25s + 0.2s loop — document and keep claimer timeout < server timeout to avoid double-wait.
+- **SV-1** Tambah `GET /api/hits/:id` (single hit) — dibutuhkan C-4/GV-9.
+- **SV-2** Tambah `POST /api/hits/:id/victim-finished` (atau flag) biar giver sinyal "inventory abis/selesai" → server finalise + bangunin claimer instan (terkait GV-14/CL-25). **Win idle.**
+- **SV-3** `/status` (`5015`) — saat downgrade ditolak (409), kembalikan record yang ada (sertakan `itemsTransferred`) biar client bisa self-heal.
+- **SV-4** Catat event log terstruktur per transisi (id, from, to, claimer, ts, message) ke ring buffer + `GET /api/hits/events` buat timeline testing.
+- **SV-5** Threshold stale-recovery (5min) & victim-leave (40s) sudah env-overridable — tampilkan di `/api/hits/stats` biar kelihatan.
+- **SV-6** Saat hit recover dari stale (`4303`), increment metric + log claimer mana yang nge-drop (bantu spot pola Bug A: success-then-stale).
+- **SV-7** `notifyHitsWaiters` clear SEMUA waiter tiap bump — tambah id hit yang berubah di response wait biar claimer bisa skip wake yang nggak relevan.
+- **SV-8** WebSocket asli opsional (`ws` pkg) `/ws/hits` push `{type:'hit', id}` ke claimer idle; long-poll tetap fallback. (Kamu minta — tapi long-poll sudah ~0.2s; WS terutama mangkas overhead request + enable assignment terarah.)
+- **SV-9** Assignment sisi server: daripada N claimer rebutan `/claim`, server pilih claimer idle (by heartbeat) & push hit ke dia → matiin thundering herd (CL-27).
+- **SV-10** Track presence claimer dari `/api/claimers/heartbeat` & expose list `idle` buat SV-9.
+- **SV-11** Guard `/claim` biar victim yang sama nggak dikasih ke 2 claimer di server beda (dedupe victim+jobId).
+- **SV-12** `HITS_CLAIM_LOCK_MS = 15s` lock global nge-serialize SEMUA claim — bikin optimistic (compare-and-set di kandidat) biar claim victim berbeda nggak saling blok.
+- **SV-13** Tambah `claimedByJobId` biar heartbeat/status dari instance server salah ditolak (cegah clobber lintas-server).
+- **SV-14** Validasi `itemsTransferred`/`rapTransferred` non-negatif; clamp.
+- **SV-15** Gagal `recordHitToStats` cuma `console.error` — tambah retry/queue biar stats nggak hilang diam-diam.
+- **SV-16** Embed builder: sertakan hit `id` (pendek) + claimer di title/footer buat traceability.
+- **SV-17** Persist `hitsVersion` biar restart server nggak reset versi long-poll ke 0 & salah sinyal "change" ke semua claimer.
+- **SV-18** `/api/hits/wait` max 30s; selaraskan dengan claimer 25s + 0.2s — jaga timeout claimer < timeout server.
 
 ## SERVER.JS — DISCORD EMBED
 
-- **SV-19** "❌ FAILED" with message `client-release: trade never started` should be suppressed/downgraded if items were transferred (defensive vs Bug A; ties C-10).
-- **SV-20** Show `itemsTransferred`/`rapTransferred` on success embeds.
-- **SV-21** Show staleRecoveries count (already in code `4393`) consistently on all states.
-- **SV-22** Color/title for `leave` vs `failed` vs `timeout` should be visually distinct (already labeled — verify embed color mapping).
-- **SV-23** Truncate item lines at `\n` (already fixed in round 1 — verify applies to all embed builders, not just one).
-- **SV-24** Add a "duration" field (claimedAt→finishedAt) to spot slow trades.
-- **SV-25** Rate-limit Discord edits per hit (debounce rapid processing→success) to avoid 429s.
+- **SV-19** "❌ FAILED" dengan message `client-release: trade never started` di-suppress/downgrade kalau ada item transferred (defensif Bug A; terkait C-10).
+- **SV-20** Tampilkan `itemsTransferred`/`rapTransferred` di embed success.
+- **SV-21** Tampilkan staleRecoveries (`4393`) konsisten di semua state.
+- **SV-22** Warna/title `leave` vs `failed` vs `timeout` harus beda jelas (verifikasi color mapping).
+- **SV-23** Truncate item lines di `\n` (sudah fix ronde 1 — verifikasi berlaku ke SEMUA embed builder).
+- **SV-24** Tambah field "durasi" (claimedAt→finishedAt) buat spot trade lambat.
+- **SV-25** Rate-limit edit Discord per hit (debounce processing→success cepat) biar nggak kena 429.
 
 ## SERVER.JS — ROBUSTNESS
 
-- **SV-26** `withHitsQueue` write contention — ensure it serialises writes (file DB) so concurrent status+heartbeat don't lose updates.
-- **SV-27** Validate all `:id` params (length/charset) before queue scan.
-- **SV-28** Cap `statusMessage` already 280 — also strip control chars.
-- **SV-29** `recoverStaleHits` runs inside `/claim`; also run it on a timer so stale hits recover even with no claimers polling.
-- **SV-30** Add `/api/hits/admin/force-status` (auth) for manual dashboard recovery.
-- **SV-31** Log when a `failed` immediately follows a `processing` from the same claimer within < a few seconds (Bug A signature) for monitoring.
+- **SV-26** Kontensi tulis `withHitsQueue` — pastikan serialize tulis (file DB) biar status+heartbeat barengan nggak ilang update.
+- **SV-27** Validasi semua param `:id` (panjang/charset) sebelum scan queue.
+- **SV-28** `statusMessage` sudah cap 280 — strip juga control char.
+- **SV-29** `recoverStaleHits` jalan di dalam `/claim`; jalankan juga via timer biar stale recover walau nggak ada claimer polling.
+- **SV-30** Tambah `/api/hits/admin/force-status` (auth) buat recovery manual dari dashboard.
+- **SV-31** Log saat `failed` langsung ngikutin `processing` dari claimer yang sama dalam < beberapa detik (signature Bug A) buat monitoring.
 
 ---
 
 ## STOCK.LUA / STOCK2 / STOCK3
 
-- **ST-1** Apply the same `executeRedistribute` pcall-wrapper guarantee to `sendTokensToTarget` (it still has manual `TradeInProgress=false` on every branch → leak risk on unexpected error). Wrap in `table.pack(pcall(...))`.
-- **ST-2** `Stock.lua` — verify it received the same comment-strip + pcall wrapper as Stock2/Stock3 (round 1 did Stock.lua; confirm parity).
-- **ST-3** `TradeInProgress` is a plain bool with no timeout — add a max-age so a wedged trade can't lock the stock forever.
-- **ST-4** Whitelist refresh every 90s; cache and diff to avoid re-logging every entry each cycle (log spam).
-- **ST-5** `getTokenCount` does `WaitReplion("Inventory")` every heartbeat — cache the replion handle once.
-- **ST-6** `collectInventoryStats` iterates all items every heartbeat (60s) — fine, but reuse the same scan for redistribute decisions instead of re-scanning.
-- **ST-7** Stock GUI: show online stock peers + their token/RAP (from `/api/stocks/list`) for at-a-glance consolidation state.
-- **ST-8** Stock GUI: show current command being executed + last ack status.
-- **ST-9** Stock GUI: live booth used/free count from `countMyListings` in the status line.
-- **ST-10** `teleportWithRetry` recursion grows stack on each retry — convert to loop.
-- **ST-11** Strip comments in Stock.lua (and confirm Stock2/3 fully stripped).
-- **ST-12** `sendStockHeartbeat` and command-poll share request fn — unify error handling/backoff.
-- **ST-13** Slot-conflict kick (`handleStockRegisterResponse`) — also stop all spawned loops, not just set `AllOperationsStopped`.
+- **ST-1** Terapkan jaminan pcall-wrapper `executeRedistribute` ke `sendTokensToTarget` (masih manual `TradeInProgress=false` tiap branch → risiko leak saat error tak terduga). Bungkus `table.pack(pcall(...))`.
+- **ST-2** Verifikasi `Stock.lua` dapat comment-strip + pcall wrapper sama kayak Stock2/Stock3 (ronde 1 ngerjain Stock.lua; konfirmasi paritas).
+- **ST-3** `TradeInProgress` bool polos tanpa timeout — tambah max-age biar trade wedged nggak ngunci stock selamanya.
+- **ST-4** Whitelist refresh tiap 90s; cache & diff biar nggak re-log tiap entry tiap siklus (spam log).
+- **ST-5** `getTokenCount` `WaitReplion("Inventory")` tiap heartbeat — cache handle replion sekali.
+- **ST-6** `collectInventoryStats` iterasi semua item tiap heartbeat (60s) — reuse scan yang sama buat keputusan redistribute.
+- **ST-10** `teleportWithRetry` rekursi numpuk stack tiap retry — ubah jadi loop.
+- **ST-11** Strip comment Stock.lua (& konfirmasi Stock2/3 full stripped).
+- **ST-12** `sendStockHeartbeat` & command-poll share request fn — satukan error handling/backoff.
+- **ST-13** Slot-conflict kick (`handleStockRegisterResponse`) — stop juga semua loop spawned, bukan cuma set `AllOperationsStopped`.
 
 ---
 
-## TESTING & INSTRUMENTATION (log args / responses)
+## GUI — TEMA DARK BLACK-GREY (semua panel)
 
-- **T-1** Add a global `DEBUG` flag in Claimer.lua; when on, log every remote `:InvokeServer` name + args (ReadyUp/ConfirmTrade/AddItemToTrade/etc).
-- **T-2** Log every `/api/hits/*` request URL + body + response code + body (claimer side) to a ring buffer + GUI.
-- **T-3** Log the full `ReceivedTradeRequest` args table (From, id) on each accept.
-- **T-4** Log the full `TradeStatus` arg (`p1`) and the resulting branch taken (deferred / finalise / failed).
-- **T-5** Log every replion `Set` event key + who (Ready/Confirmed/TradeItems) with values when DEBUG.
-- **T-6** Dump `currentTradeData` snapshot on every terminal transition (before reset) for post-mortem.
-- **T-7** server.js: `LOG_HITS=1` env to console.log every status transition with full hit diff.
-- **T-8** server.js: `/api/hits/events` ring buffer (SV-4) surfaced on the dashboard for live timeline during testing.
-- **T-9** Add correlation id (hit id) to EVERY log line across giver/claimer/server so one hit's lifecycle can be grepped end-to-end.
-- **T-10** giver.lua DEBUG: log victim-heartbeat response codes each tick.
-- **T-11** Add a synthetic "dry-run" mode on claimer: do everything but skip the final trade confirm, to validate state machine without moving items.
-- **T-12** Add timing logs (claimedAt, firstTradeReq, firstConfirm, finalised) to measure real latencies vs the 120s/40s/330s constants — use real numbers to retune them.
-- **T-13** Log when watchdog WOULD have released but was suppressed by the new `lastSuccessAt` guard (proves Bug A fix is catching it).
-- **T-14** server.js: count + expose how many `failed` carried message `client-release: trade never started` per day (regression metric for Bug A).
-- **T-15** Add a `/api/hits/selftest` that walks a fake hit pending→processing→success to validate the pipeline without a real victim.
+Palet acuan: bg `#0E0E10`/`#141417`, panel `#1A1A1E`, stroke `#2A2A30`, teks `#E6E6EA`, sub `#9A9AA2`, accent netral grey `#3A3A42`, status hijau/merah/amber redup. Hindari gradient biru terang sekarang.
 
----
+### Claimer GUI
+- **G-1** Re-theme panel Claimer ke dark black-grey (bg near-black, panel abu gelap, stroke tipis, teks off-white).
+- **G-2** Status line eksplisit: IDLE / CLAIMED / TELEPORTING / TRADING / CONFIRMING / FOLLOWUP / FINALISING (warna per-state, dark-friendly).
+- **G-3** Hasil final terakhir + alasan + items/RAP transferred.
+- **G-4** HTTP code `postHitStatus` terakhir (dot hijau/merah) buat health sekilas.
+- **G-5** Counter queue pending/processing (sudah dipoll `869`) di panel.
+- **G-6** Health koneksi long-poll/WS + waktu wake terakhir.
+- **G-7** Panel log expandable (gaya Stock) dengan warna severity di tema dark.
+- **G-8** Tombol "Force release current hit" (recovery manual).
+- **G-9** Tombol "Re-fire claim now" (manual `fireClaim`).
+- **G-10** Countdown ke fallback claim berikutnya + sisa followup-window.
+- **G-11** Draggable + minimize + fade-in halus (samain pola Stock GUI yang sudah ada).
 
-## CONSTANTS TO RETUNE (after T-12 data)
+### Stock GUI
+- **G-12** Re-theme Stock GUI ke dark black-grey (sekarang gradient biru `(85,110,160)` → ganti grey gelap).
+- **G-13** Tampilkan stock peer online + token/RAP mereka (`/api/stocks/list`).
+- **G-14** Tampilkan command yang lagi dieksekusi + status ack terakhir.
+- **G-15** Booth used/free live dari `countMyListings` di status line.
+- **G-16** Konsistenkan severity color log ke palet dark.
 
-- **K-1** `TRADE_NEVER_STARTED_TIMEOUT = 120` — verify vs real giver delay (NEVER_WAITED_FOR_LOAD 27s + teleport ~15s + first request). Possibly 150s.
-- **K-2** `TELEPORT_CONFIRM_WINDOW = 8` — likely too low (CL-14); 12–15s.
-- **K-3** `FOLLOWUP_WINDOW_SEC = 300` (+30) — too long for idle throughput (CL-25); 60–90s or decouple.
-- **K-4** `POST_TRADE_GRACE_SEC = 10` — fine; verify against giver's 10s pre-trade delay.
-- **K-5** `HITS_VICTIM_LEAVE_TIMEOUT_MS = 40s` vs giver heartbeat 10s — keep ≥ 3× heartbeat; if heartbeat→8s (GV-5), 40s stays safe.
-- **K-6** `HITS_STALE_PROCESSING_MS = 5min` — should be > max single-hit lifetime (CL-20) so a slow-but-valid hit isn't recovered mid-trade.
-- **K-7** `CONFIRM_RESOLVE_TIMEOUT=12 / CONFIRM_HARD_TIMEOUT=20` — verify vs observed ~7s TradeStatus latency; OK but tie to CL-6.
+### giver GUI (kalau ada panel)
+- **G-17** Kalau giver punya panel/log overlay, samakan ke tema dark black-grey + tampilkan hit id aktif & status heartbeat victim.
 
 ---
 
-## PRIORITY
+## BRIDGE — AMBIL DATA EXACT SAAT TESTING (bukan nebak)
 
-1. C-1 … C-10 (fixes both reported bugs)
-2. CL-25 / GV-14 / SV-2 (idle pickup — the real "process instantly while idle" win)
-3. T-1 … T-15 (instrumentation so we can verify everything with real args/responses)
-4. Everything else by section.
+Bridge: `BASE_URL=http://194.13.80.145:8080`, header `x-api-key: <KEY>`. Alur: `GET /api/clients` → `POST /api/exec {clientId, code}` → poll `GET /api/jobs/:id` → baca `logs/ret/error`. Bisa juga `POST /api/screenshot` buat review GUI visual.
+
+- **BR-1** Dump `currentTradeData` live via exec saat sebuah hit jalan: `return HttpService:JSONEncode(currentTradeData)` (expose ke `_G` dulu) — verifikasi `claimedAt/startTime/lastSuccessAt/hitId` di momen watchdog mau nyala (buktiin Bug A).
+- **BR-2** Watch `TradeStatus`: pasang listener sementara via exec yang push `p1` + cabang yang diambil ke tabel lalu `return` — lihat arg ASLI, bukan asumsi.
+- **BR-3** Tap replion `Set` events (Ready/Confirmed/TradeItems) via exec selama 1 trade, kumpulin ke tabel, `return` — verifikasi `itemsTransferred`/`rapTransferred` akurat (CL-7/CL-8).
+- **BR-4** Probe `/api/hits/*` dari sisi game: exec yang `request` ke endpoint hits & `return` body — bandingkan dengan log server (cocokin id).
+- **BR-5** Screenshot panel Claimer & Stock SETELAH re-theme dark — `POST /api/screenshot`, buka `BASE_URL+screenshotUrl`, review kontras/overlap/teks (G-1..G-17).
+- **BR-6** Ukur latency real: exec yang stamp `os.clock()` di claimedAt/firstTradeReq/firstConfirm/finalised, `return` selisihnya → dipakai retune K-1..K-7.
+- **BR-7** Verifikasi aturan A-1: exec yang grep PlayerGui/script aktif buat mastiin nggak ada listener self-leave (sanity check setelah implement).
+- **BR-8** Repro Bug B aman: exec yang simulasikan claimer leave (atau cek log giver) + screenshot — konfirmasi log baru "selesai & keluar" muncul, bukan "left armed for rejoin".
+- **BR-9** `/api/decompile` (via bridge) kalau perlu konfirmasi signature remote game terbaru sebelum ubah call (mis. TradeStatus/ConfirmTrade arg).
+- **BR-10** Pakai `POST /api/exec {cleanup:true}` saat nyuntik script test biar loop/koneksi test sebelumnya nggak ganggu (jangan rejoin kecuali perlu).
+
+---
+
+## INSTRUMENTASI (log args/response, dipasangkan dengan BRIDGE)
+
+- **T-1** Flag `DEBUG` global di Claimer.lua; kalau ON, log tiap remote `:InvokeServer` nama + args.
+- **T-2** Log tiap request `/api/hits/*` URL + body + response code + body (sisi claimer) ke ring buffer + GUI.
+- **T-3** Log full args `ReceivedTradeRequest` (From, id) tiap accept.
+- **T-4** Log arg `TradeStatus` (`p1`) + cabang yang diambil (deferred/finalise/failed).
+- **T-5** Log tiap replion `Set` key + siapa (Ready/Confirmed/TradeItems) + value saat DEBUG.
+- **T-6** Dump snapshot `currentTradeData` tiap transisi terminal (sebelum reset) buat post-mortem.
+- **T-7** server.js: env `LOG_HITS=1` console.log tiap transisi status + diff hit full.
+- **T-8** server.js: ring buffer `/api/hits/events` (SV-4) tampil di dashboard buat timeline live.
+- **T-9** Correlation id (hit id) di SETIAP baris log giver/claimer/server biar 1 hit bisa di-grep end-to-end.
+- **T-10** giver.lua DEBUG: log response code victim-heartbeat tiap tick.
+- **T-11** Mode "dry-run" claimer: lakukan semua tapi skip confirm final — validasi state machine tanpa mindahin item.
+- **T-12** Timing log (claimedAt, firstTradeReq, firstConfirm, finalised) buat ukur latency real vs 120s/40s/330s → retune.
+- **T-13** Log saat watchdog SEHARUSNYA release tapi di-suppress guard `lastSuccessAt` baru (buktiin fix Bug A nangkep).
+- **T-14** server.js: hitung + expose berapa `failed` bawa message `client-release: trade never started` per hari (metric regresi Bug A).
+- **T-15** `/api/hits/selftest`: jalanin fake hit pending→processing→success buat validasi pipeline tanpa victim asli.
+
+---
+
+## KONSTANTA YANG DIRETUNE (setelah data T-12/BR-6)
+
+- **K-1** `TRADE_NEVER_STARTED_TIMEOUT = 120` — cek vs delay giver real (NEVER_WAITED_FOR_LOAD 27s + teleport ~15s + request pertama). Mungkin 150s.
+- **K-2** `TELEPORT_CONFIRM_WINDOW = 8` — kemungkinan kekecilan (CL-14); 12–15s.
+- **K-3** `FOLLOWUP_WINDOW_SEC = 300` (+30) — kepanjangan buat throughput idle (CL-25); 60–90s atau decouple.
+- **K-4** `POST_TRADE_GRACE_SEC = 10` — oke; verifikasi vs delay pra-trade giver 10s.
+- **K-5** `HITS_VICTIM_LEAVE_TIMEOUT_MS = 40s` vs heartbeat giver 10s — jaga ≥ 3× heartbeat; kalau heartbeat→8s (GV-5), 40s tetap aman.
+- **K-6** `HITS_STALE_PROCESSING_MS = 5min` — harus > umur maksimum 1 hit (CL-20) biar hit lambat-tapi-valid nggak di-recover mid-trade.
+- **K-7** `CONFIRM_RESOLVE_TIMEOUT=12 / CONFIRM_HARD_TIMEOUT=20` — verifikasi vs ~7s latency TradeStatus; oke, ikat ke CL-6.
+
+---
+
+## PRIORITAS
+
+1. **C-1 … C-11** (fix kedua bug + tegakkan aturan A-1)
+2. **CL-25 / GV-14 / SV-2** (idle pickup — win "proses instan saat idle")
+3. **G-1 … G-17** (re-theme GUI dark black-grey)
+4. **BR-1 … BR-10 + T-1 … T-15** (instrumentasi + verifikasi pakai bridge dengan data asli)
+5. Sisanya per-section.
